@@ -1,0 +1,38 @@
+name: Auto Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Get parent repository
+        id: parent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const parent = context.payload.repository.parent.full_name;
+            console.log(`parent=${parent}`);
+            core.setOutput('parent', parent);
+
+      - name: Add upstream remote and sync
+        env:
+          PARENT: ${{ steps.parent.outputs.parent }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add upstream "https://github.com/${PARENT}.git"
+          git fetch upstream
+          git checkout ${{ github.event.repository.default_branch }}
+          git merge upstream/${{ github.event.repository.default_branch }} --no-edit
+          git push origin ${{ github.event.repository.default_branch }}
