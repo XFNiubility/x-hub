@@ -305,6 +305,8 @@ export interface AppConfig {
   clock_quote: string // 时钟卡片语录（可配置，空串回退默认）
   notice_duration_ms: number // 右下角通知弹窗驻留时长（毫秒，1000–60000）
   online_enabled: boolean // 联网功能总开关（默认开）
+  /** 云同步「自动同步」开关（默认关）：开 = outbox 非空 / 定时 / 聚焦自动同步；关 = 只手动「立即同步」 */
+  sync_auto_enabled: boolean
   /** AI 助手默认权限档：readonly（仅可查看）/ ask（每次都问，默认）/ full（完全权限）。
    *  对话框快捷切换未手动调整时以此初始化；后端命令缺省回落同款安全默认 ask */
   agent_permission_mode: string
@@ -1262,6 +1264,44 @@ export interface AgentApprovalAsk {
   level: string
 }
 
+// ---- 云同步（docs/sync-protocol.md：E2EE，口令只在设备本地派生）----
+
+/** sync_status 首屏总状态 */
+export interface SyncStatus {
+  paired: boolean
+  keyReady: boolean
+  spaceId: string | null
+  deviceId: string | null
+  pullSeq: number
+  /** outbox 待推条数 */
+  pending: number
+  keyVersion: number
+}
+
+/** GET /sync/devices 的设备行（created_at / last_seen_at 为 ms；last_seen_at null = 从未连接） */
+export interface SyncDeviceInfo {
+  id: string
+  kind: 'desktop' | 'mini' | string
+  name: string
+  created_at: number
+  last_seen_at: number | null
+}
+
+/** sync_now 一轮结果（applied = 远端落库条数，pushed = 本端推送成功条数） */
+export interface SyncNowResult {
+  applied: number
+  pushed: number
+  failed: number
+  /** 服务端按条拒收、已跳过 outbox 的条目数（数据本身不可接受，重试也不会成功） */
+  rejected?: number
+}
+
+/** sync_poll_pairing：pending / completed / expired / cancelled */
+export interface SyncPairingPoll {
+  status: string
+  deviceName: string | null
+}
+
 export const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
 export const tauriApi = {
@@ -1601,6 +1641,10 @@ export const tauriApi = {
   setNoteTags: (noteId: number, tagIds: number[]) =>
     invoke<void>('set_note_tags', { noteId, tagIds }),
   listNoteTags: () => invoke<NoteTagRow[]>('list_note_tags'),
+  /** 待办视图一键导出：Rust 侧弹保存对话框（绕过插件 ACL，dev/prod 行为一致），None = 用户取消 */
+  pickSavePath: (defaultName: string) => invoke<string | null>('pick_save_path', { defaultName }),
+  /** 待办视图一键导出：内容前端按当前筛选组装好，这里只写盘到保存对话框选定的路径 */
+  exportTodos: (path: string, content: string) => invoke<void>('export_todos', { path, content }),
   backupData: (targetDir: string) => invoke<string>('backup_data', { targetDir }),
   restoreData: (source: string) => invoke<void>('restore_data', { source }),
   getDataPath: () => invoke<DataPathInfo>('get_data_path'),
@@ -2012,4 +2056,29 @@ export const tauriApi = {
   /** 桥 API 统一分发：扩展 iframe 经主窗口转发调用 */
   xhubCall: (extId: string, namespace: string, method: string, args: unknown) =>
     invoke<unknown>('xhub_call', { extId, namespace, method, args }),
+  // ---- 云同步（docs/sync-protocol.md §8.3 的 9 条命令）----
+  /** 同步总状态（SyncPanel 首屏） */
+  syncStatus: () => invoke<SyncStatus>('sync_status'),
+  /** 开启云同步：设口令 → 派生 → 建空间；口令至少 8 位，失败抛中文错误 */
+  syncEnable: (passphrase: string) =>
+    invoke<{ spaceId: string; deviceId: string }>('sync_enable', { passphrase }),
+  /** 出配对二维码：返回二维码内容 JSON 字符串（只含一次性配对凭据，无任何密钥） */
+  syncBeginPairing: () => invoke<string>('sync_begin_pairing'),
+  /** 轮询配对状态（弹窗打开期间 2s 一次） */
+  syncPollPairing: (pairingId: string) =>
+    invoke<SyncPairingPoll>('sync_poll_pairing', { pairingId }),
+  /** 自动同步（聚焦/定时/配对完成后由后端自触发；受「自动同步」开关门控，前端一般不用手动调） */
+  syncAuto: () => invoke<SyncNowResult & { skipped?: boolean; reason?: string }>('sync_auto'),
+  /** 云同步「自动同步」开关：开 = 后台触发点自动同步；关 = 只手动「立即同步」 */
+  setSyncAutoEnabled: (enabled: boolean) => invoke<boolean>('set_sync_auto_enabled', { enabled }),
+  /** 取消配对会话（关闭二维码 / 过期时） */
+  syncPairingCancel: (pairingId: string) => invoke<void>('sync_pairing_cancel', { pairingId }),
+  /** 一次完整同步轮（pull → push）；应用过远端数据则后端广播 sync-applied */
+  syncNow: () => invoke<SyncNowResult>('sync_now'),
+  /** 设备列表（本空间的活跃设备） */
+  syncDeviceList: () => invoke<{ devices: SyncDeviceInfo[] }>('sync_device_list'),
+  /** 撤销某台设备（主人操作，撤销后该设备需重新扫码） */
+  syncRevokeDevice: (deviceId: string) => invoke<unknown>('sync_revoke_device', { deviceId }),
+  /** 关闭本机同步：吊销自己的设备行 + 清本地钥匙（云端密文保留） */
+  syncDisable: () => invoke<{ ok: boolean }>('sync_disable'),
 }

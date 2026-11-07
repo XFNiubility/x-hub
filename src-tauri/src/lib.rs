@@ -39,6 +39,7 @@ mod service;
 mod shortcut;
 pub mod signing;
 mod skills;
+pub mod sync;
 mod suda_browser;
 mod sticky_window;
 mod sysmon;
@@ -46,6 +47,7 @@ mod todo_reminder;
 mod todo_recurrence;
 mod tray;
 pub mod updater;
+mod webview_focus;
 mod webview_mem;
 mod win_taskbar;
 mod xhub_api;
@@ -62,6 +64,11 @@ mod xhub_api;
 /// - --js-flags=--scavenger_max_new_space_capacity_mb=8：压 V8 新生代堆上限，
 ///   降低 JS 引擎常驻内存；若主窗/编辑器出现 GC 卡顿可放宽到 16–32
 /// - --disk-cache-size=33554432：磁盘缓存上限 32MB
+/// ⚠️ 勿再追加 --enable-low-end-device-mode（v0.9.9 曾加、2026-11-07 摘除）：
+///   低端模式合成立即可见面板上出现网格状伪影；且该参数属环境级，两处参数
+///   （本常量 ↔ tauri.conf.json 主窗）不一致会导致后续 webview 创建全部失败
+///   （WebView2 0x8007139F），守卫测试 webview_mem::tests::
+///   additional_browser_args_match_tauri_conf 锁两处逐字一致。
 pub const ADDITIONAL_BROWSER_ARGS: &str =
     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --js-flags=--scavenger_max_new_space_capacity_mb=8 --disk-cache-size=33554432";
 
@@ -771,6 +778,44 @@ pub fn run() {
                 account::verify_session_on_startup(&account_handle).await;
             });
 
+            // 云同步自动推送与定时对账（协议 §6.4 档 0）：
+            // - 本地改动：outbox 触发器已经标脏，但没有任何东西会去推。这里每 10s 看一眼
+            //   outbox（纯本地 SQLite count，不发网络），非空才触发一轮同步。
+            //   这样命令、agent 工具、扩展桥、周期滚动等所有写路径都被覆盖，
+            //   不必在每处埋调用点。
+            // - 远端变更：每 5 分钟强制对一轮（手机上改的东西落到桌面）。
+            // 都走 sync_auto（内部 20s 节流）；未开启同步时是空操作。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    let mut since_forced = std::time::Instant::now();
+                    loop {
+                        let has_pending = {
+                            let state = handle.state::<DbState>();
+                            let pending = match state.0.lock() {
+                                Ok(conn) => crate::sync::repo::outbox_list(&conn, 1)
+                                    .map(|v| !v.is_empty())
+                                    .unwrap_or(false),
+                                Err(_) => false,
+                            };
+                            pending
+                        };
+                        let force = since_forced.elapsed() >= std::time::Duration::from_secs(300);
+                        if has_pending || force {
+                            if force {
+                                since_forced = std::time::Instant::now();
+                            }
+                            let state = handle.state::<DbState>();
+                            if let Err(e) = crate::sync::commands::sync_auto(handle.clone(), state).await {
+                                log::warn!("[云同步] 自动同步失败: {e}");
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                });
+            }
+
             // 平台模型清单启动对账（约定 33 自愈）：客户端快照只在「打开平台额度开关」
             // 那一刻拉过一次，服务端后台加减模型后不会自己更新。延后 8s 静默对账一次
             // （避开启动期争抢），有变化由 sync_platform_models 落盘并广播
@@ -850,10 +895,14 @@ pub fn run() {
                 // 启动即前台：避免窗口偶尔出现在其他窗口后面；稍等再补一次焦点，
                 // 绕开 Windows 前台锁定的瞬时限制
                 let _ = window.set_focus();
+                crate::webview_focus::focus_webview(app.handle(), "main");
                 let handle = window.clone();
+                let app_handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     let _ = handle.set_focus();
+                    // 首帧渲染完 webview 子窗才稳定：这时再补一次键盘焦点（同上）
+                    crate::webview_focus::focus_webview(&app_handle, "main");
                 });
             }
 
@@ -947,6 +996,19 @@ pub fn run() {
                             crate::floating_ball::set_main_minimized(&app_handle, minimized);
                             schedule_geometry_save(&app_handle);
                         }
+                        // 从别的应用切回主窗（点任务栏 / Alt+Tab / 点窗口任意处）：把键盘
+                        // 焦点补进 webview。窗口被激活 ≠ 焦点进了页面，缺这一刀就是
+                        // 「切回来按 ESC 没反应，得先点一下」（见 webview_focus.rs）
+                        tauri::WindowEvent::Focused(true) => {
+                            crate::webview_focus::focus_webview(&app_handle, "main");
+                            // 切回窗口顺手对账一次（协议 §6.4 档 0）：节流在命令内部，
+                            // 未开启云同步时是空操作
+                            let h = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state = h.state::<DbState>();
+                                let _ = crate::sync::commands::sync_auto(h.clone(), state).await;
+                            });
+                        }
                         _ => {}
                     }
                 });
@@ -1037,6 +1099,17 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_initial_data,
+            sync::commands::sync_status,
+            sync::commands::sync_enable,
+            sync::commands::sync_begin_pairing,
+            sync::commands::sync_poll_pairing,
+            sync::commands::sync_pairing_cancel,
+            sync::commands::sync_now,
+            sync::commands::sync_auto,
+            commands::set_sync_auto_enabled,
+            sync::commands::sync_device_list,
+            sync::commands::sync_revoke_device,
+            sync::commands::sync_disable,
             commands::list_resources,
             commands::create_resource,
             commands::update_resource,
@@ -1191,6 +1264,8 @@ pub fn run() {
             commands::set_note_tags,
             commands::list_note_tags,
             commands::backup_data,
+            commands::pick_save_path,
+            commands::export_todos,
             commands::restore_data,
             commands::get_data_path,
             commands::change_data_dir,
