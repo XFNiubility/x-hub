@@ -2,6 +2,7 @@ name: Auto Sync Upstream
 
 on:
   schedule:
+    # 每天 08:00 UTC（北京时间 16:00）
     - cron: '0 8 * * *'
   workflow_dispatch:
 
@@ -9,30 +10,35 @@ permissions:
   contents: write
 
 jobs:
-  sync-upstream:
+  sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
 
-      - name: Get parent repository
-        id: parent
+      - name: Sync upstream (only when upstream has new commits)
         uses: actions/github-script@v7
         with:
           script: |
-            const parent = context.payload.repository.parent.full_name;
-            console.log(`parent=${parent}`);
-            core.setOutput('parent', parent);
+            const repo = context.repo;
+            const { data: fork } = await github.rest.repos.get({ owner: repo.owner, repo: repo.repo });
+            const parent = fork.parent;
+            if (!parent) {
+              console.log('No upstream parent, skip.');
+              return;
+            }
+            const upstream = `${parent.owner.login}/${parent.name}`;
+            const branch = parent.default_branch;
+            const runGit = require('child_process').execSync;
 
-      - name: Add upstream remote and sync
-        env:
-          PARENT: ${{ steps.parent.outputs.parent }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git remote add upstream "https://github.com/${PARENT}.git"
-          git fetch upstream
-          git checkout ${{ github.event.repository.default_branch }}
-          git merge upstream/${{ github.event.repository.default_branch }} --no-edit
-          git push origin ${{ github.event.repository.default_branch }}
+            runGit(`git remote add upstream https://github.com/${upstream}.git`, { stdio: 'inherit' });
+            runGit(`git fetch upstream ${branch}`, { stdio: 'inherit' });
+            const behind = runGit(`git rev-list --count HEAD..upstream/${branch}`).toString().trim();
+            if (behind === '0') {
+              console.log(`Upstream ${upstream} has no new commits, skip sync. No changes pushed.`);
+              return;
+            }
+            runGit(`git merge upstream/${branch} --no-edit`, { stdio: 'inherit' });
+            runGit(`git push origin ${branch}`, { stdio: 'inherit' });
+            console.log(`Synced ${behind} new commits from ${upstream}.`);
